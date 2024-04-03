@@ -1,0 +1,12 @@
+*.png
+*.npy
+*.json
+*.mat
+*.tar
+.vscode-server/*
+*.pyc
+/logs/*
+.bash_history
+*.crl
+known_hosts
+.gitconfig

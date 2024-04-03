@@ -21,7 +21,8 @@ from tqdm import tqdm, trange
 
 from utils.load_tof import load_tof_data
 from utils.nerf_helpers import *
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -184,12 +185,12 @@ def create_nerf(args):
         ckpt = torch.load(ckpt_path)
 
         start = ckpt['global_step']
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        # optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
         # Load model
-        model.load_state_dict(ckpt['network_fn_state_dict'])
-        if model_fine is not None:
-            model_fine.load_state_dict(ckpt['network_fine_state_dict'])
+        # model.load_state_dict(ckpt['network_fn_state_dict'])
+        # if model_fine is not None:
+        #     model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
     ##########################
 

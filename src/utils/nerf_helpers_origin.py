@@ -74,7 +74,7 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=1, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, intensity=False, density_only=True):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, intensity=False, density_only=True):
         """ 
         """
         super(NeRF, self).__init__()
@@ -85,41 +85,15 @@ class NeRF(nn.Module):
         self.skips = skips
         self.use_viewdirs = use_viewdirs
         
-        self.pts_linears = nn.Linear(input_ch, W)
-                
-        # self.pts_linears = nn.ModuleList(
-        #     [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
         
-        # self.pts_linears_a = nn.ModuleList(
-        #     [nn.Linear(W, W) for i in range(D-1)])
-
-        # self.q_fcs = nn.ModuleList([])
-        self.view_crosstrans = nn.ModuleList([])
-        #65536 63
-        trans_depth = 1
-        for i in range(trans_depth):
-            # view transformer
-            ray_trans = Transformer(
-                dim=W,
-                ff_hid_dim=int(W * 4),
-                n_heads = 8 ,
-                ff_dp_rate=0.1,
-                attn_dp_rate=0.1,
-            )
-            self.view_crosstrans.append(ray_trans)
-
-        self.q_fc = nn.Sequential(
-                nn.Linear(63, W),
-                nn.ReLU(),
-                nn.Linear(W, W),
-                )
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
-        
+
         ### Implementation according to the paper
         # self.views_linears = nn.ModuleList(
         #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-        self.norm = nn.LayerNorm(W)
         
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
@@ -135,20 +109,12 @@ class NeRF(nn.Module):
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        
         h = input_pts
-        h = self.pts_linears(h)
-        h = F.relu(h)
-        for i, l in enumerate(self.view_crosstrans):
-            h = self.view_crosstrans[i](h, False)
+        for i, l in enumerate(self.pts_linears):
+            h = self.pts_linears[i](h)
             h = F.relu(h)
-        h = self.norm(h)
-
-        # for i, l in enumerate(self.pts_linears_a):
-        #     h = self.pts_linears_a[i](h)
-        #     h = F.relu(h)
-
-        h = self.norm(h)
+            if i in self.skips:
+                h = torch.cat([input_pts, h], -1)
 
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
@@ -165,6 +131,7 @@ class NeRF(nn.Module):
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
+
         return outputs    
 
     def load_weights_from_keras(self, weights):
@@ -286,110 +253,3 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
-
-# Ray Transformer
-class Transformer(nn.Module):
-    def __init__(
-        self, dim, ff_hid_dim, ff_dp_rate, n_heads, attn_dp_rate, attn_mode="qk", pos_dim=None
-    ):
-        super(Transformer, self).__init__()
-        self.attn_norm = nn.LayerNorm(dim, eps=1e-6)
-        self.ff_norm = nn.LayerNorm(dim, eps=1e-6)
-
-        self.ff = FeedForward(dim, ff_hid_dim, ff_dp_rate)
-        self.attn = Attention(dim, n_heads, attn_dp_rate, attn_mode, pos_dim)
-
-    def forward(self, x, pos=None, ret_attn=False):
-        residue = x
-        x = self.attn_norm(x)
-        x = self.attn(x, pos, ret_attn)
-        if ret_attn:
-            x, attn = x
-        x = x + residue
-
-        residue = x
-        x = self.ff_norm(x)
-        x = self.ff(x)
-        x = x + residue
-
-        if ret_attn:
-            return x, attn.mean(dim=1)[:, 0]
-        else:
-            return x
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hid_dim, dp_rate):
-        super(FeedForward, self).__init__()
-        self.fc1 = nn.Linear(dim, hid_dim)
-        self.fc2 = nn.Linear(hid_dim, dim)
-        # self.dp = nn.Dropout(dp_rate)
-        self.activ = nn.ReLU()
-
-    def forward(self, x):
-        x = self.activ(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-
-# attention module for self attention.
-# contains several adaptations to incorportate positional information (NOT IN PAPER)
-#   - qk (default) -> only (q.k) attention.
-#   - pos -> replace (q.k) attention with position attention.
-#   - gate -> weighted addition of  (q.k) attention and position attention.
-class Attention(nn.Module):
-    def __init__(self, dim, n_heads, dp_rate, attn_mode="qk", pos_dim=None):
-        super(Attention, self).__init__()
-        if attn_mode in ["qk", "gate"]:
-            self.q_fc = nn.Linear(dim, dim, bias=False)
-            self.k_fc = nn.Linear(dim, dim, bias=False)
-        if attn_mode in ["pos", "gate"]:
-            self.pos_fc = nn.Sequential(
-                nn.Linear(pos_dim, pos_dim), nn.ReLU(), nn.Linear(pos_dim, dim // 8)
-            )
-            self.head_fc = nn.Linear(dim // 8, n_heads)
-        if attn_mode == "gate":
-            self.gate = nn.Parameter(torch.ones(n_heads))
-        self.v_fc = nn.Linear(dim, dim, bias=False)
-        self.out_fc = nn.Linear(dim, dim)
-        self.dp = nn.Dropout(dp_rate)
-        self.n_heads = 4
-        self.attn_mode = attn_mode
-
-    def forward(self, x, pos=None, ret_attn=False):
-        if self.attn_mode in ["qk", "gate"]:
-            if x.shape[0] == 5696:
-                x = x.view(89, 256 , -1)
-            else:
-                x = x.view(256, 256 , -1)
-            q = self.q_fc(x)
-            q = q.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
-            k = self.k_fc(x)
-            k = k.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
-        v = self.v_fc(x)
-        v = v.view(x.shape[0], x.shape[1], self.n_heads, -1).permute(0, 2, 1, 3)
-
-        if self.attn_mode in ["qk", "gate"]:
-            attn = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(q.shape[-1])
-            attn = torch.softmax(attn, dim=-1)
-        elif self.attn_mode == "pos":
-            pos = self.pos_fc(pos)
-            attn = self.head_fc(pos[:, :, None, :] - pos[:, None, :, :]).permute(0, 3, 1, 2)
-            attn = torch.softmax(attn, dim=-1)
-        if self.attn_mode == "gate":
-            pos = self.pos_fc(pos)
-            pos_attn = self.head_fc(pos[:, :, None, :] - pos[:, None, :, :]).permute(0, 3, 1, 2)
-            pos_attn = torch.softmax(pos_attn, dim=-1)
-            gate = self.gate.view(1, -1, 1, 1)
-            attn = (1.0 - torch.sigmoid(gate)) * attn + torch.sigmoid(gate) * pos_attn
-            attn /= attn.sum(dim=-1).unsqueeze(-1)
-        # attn = self.dp(attn)
-
-        out = torch.matmul(attn, v).permute(0, 2, 1, 3).contiguous()
-        out = out.view(x.shape[0], x.shape[1], -1)
-        out = self.out_fc(out)
-        out = out.view(-1 , 256)
-
-        if ret_attn:
-            return out, attn
-        else:
-            return out

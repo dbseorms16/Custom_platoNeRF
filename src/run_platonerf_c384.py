@@ -17,12 +17,12 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from copy import deepcopy
 from tqdm import tqdm, trange
 
-from utils.load_tof import load_real
-from utils.nerf_helpers import *
-
+from utils.load_tof import load_tof_data
+from utils.nerf_helpers_c384 import *
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -134,48 +134,6 @@ def render(rays,
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
-
-
-def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
-
-    H, W, focal = hwf
-
-    if render_factor!=0:
-        # Render downsampled for speed
-        H = H//render_factor
-        W = W//render_factor
-        focal = focal/render_factor
-
-    rgbs = []
-    disps = []
-
-    t = time.time()
-    for i, c2w in enumerate(tqdm(render_poses)):
-        print(i, time.time() - t)
-        t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
-        rgbs.append(rgb.cpu().numpy())
-        disps.append(disp.cpu().numpy())
-        if i==0:
-            print(rgb.shape, disp.shape)
-
-        """
-        if gt_imgs is not None and render_factor==0:
-            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
-            print(p)
-        """
-
-        if savedir is not None:
-            rgb8 = to8b(rgbs[-1])
-            filename = os.path.join(savedir, '{:03d}.png'.format(i))
-            imageio.imwrite(filename, rgb8)
-
-
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
-
-    return rgbs, disps
-
 
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
@@ -383,55 +341,7 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
-
-    """
-    import matplotlib.pyplot as plt
-    fig = plt.figure()
-    ax = plt.axes(projection='3d')
-    for idx in range(pts.shape[0]):
-        start = rays_o[idx]
-        stop = pts[idx][-1]
-        line = torch.stack([start, stop], dim=0)
-        line = line.detach().cpu().numpy()
-        ax.plot3D(line[:,0], line[:,1], line[:,2], 'gray')
-        if idx > 50:
-            break
-    fig.savefig("new_rays.png", dpi=600)
-    """
-
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib import animation
-    from mpl_toolkits.mplot3d import Axes3D
-    fig = plt.figure()
-    ax = Axes3D(fig)
-
-    def init():
-        #ax.scatter(xx, yy, zz, marker='o', s=20, c="goldenrod", alpha=0.6)
-        for idx in range(pts.shape[0]):
-            start = rays_o[idx]
-            stop = pts[idx][-1]
-            line = torch.stack([start, stop], dim=0)
-            line = line.detach().cpu().numpy()
-            ax.plot3D(line[:,0], line[:,2], line[:,1], 'gray')
-            if idx > 50:
-                break
-        return fig,
-
-    def animate(i):
-        ax.view_init(elev=10., azim=i)
-        return fig,
-
-    # Animate
-    anim = animation.FuncAnimation(fig, animate, init_func=init,
-                                   frames=360, interval=20, blit=True)
-    # Save
-    anim.save('basic_animation_{}.mp4'.format(debug_title), fps=30, extra_args=['-vcodec', 'libx264'])
-    #exit()
-    """
-
     raw = network_query_fn(pts, viewdirs, network_fn)
-
     intensity_map, disp_map, acc_map, weights, depth_map, trans = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
@@ -485,12 +395,19 @@ def config_parser():
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/llff/fern', 
                         help='input data directory')
+    parser.add_argument("--use_all_rays", type=int, default=0,
+                        help='whether or not to use all rays')
+    parser.add_argument("--per_image_thresh", type=float, action='append', required=True)
     parser.add_argument("--debug", type=int, default=0,
                         help='whether or not to debug')
-    parser.add_argument("--near", type=float, default=0.0,
+    parser.add_argument("--near", type=float, default=0.1,
                         help='near plane')
     parser.add_argument("--dist_weight", type=int, default=1000,
                         help='dist weight')
+    parser.add_argument("--extract_first", type=int, default=0,
+                        help='whether or not to extract 1b distance to compute projected illumination')
+    parser.add_argument("--parallel", type=float, default=0.05,
+                        help='parallel filter')
     parser.add_argument("--shadw", type=float, default=1.0,
                         help='shadow loss weight for shadow pixels')
     parser.add_argument("--nonshadw", type=float, default=1.0,
@@ -498,6 +415,10 @@ def config_parser():
     parser.add_argument("--ignore", type=int, action='append', required=False, default=[])
     parser.add_argument("--downsample", type=int, default=1,
                         help='downsample rays by factor of x')
+    parser.add_argument("--downsample_temp", type=int, default=0,
+                        help='downsample rays by factor of x')
+    parser.add_argument("--save_lights", type=int, default=0,
+                        help='save light paths')
     parser.add_argument("--vis_rays", type=int, default=0,
                         help='visualize ray paths via a video; 1 true, 0 false')
 
@@ -608,6 +529,64 @@ def config_parser():
 
     return parser
 
+
+def LinePlaneCollision(planeNormal, planePoint, rayDirection, rayPoint, epsilon=1e-6):
+
+    ndotu = planeNormal.dot(rayDirection)
+    if abs(ndotu) < epsilon:
+        return None
+
+    w = rayPoint - planePoint
+    si = -planeNormal.dot(w) / ndotu
+    Psi = w + si * rayDirection + planePoint
+    return Psi
+
+def find_ray_intersections(rays, walls):
+    pixels = []
+    intersections = []
+    distances = []
+    for idx in range(rays.shape[0]):
+        ray_o = rays[idx,0]
+        ray_d = rays[idx,1]
+        plane_normal = np.array(walls[idx,:3])
+        plane_point = np.array(walls[idx,3:6])
+        x = walls[idx, 6]
+        min_y = walls[idx, 7]
+        max_y = walls[idx, 8]
+        min_z = walls[idx, 9]
+        max_z = walls[idx, 10]
+
+        intersection_point = LinePlaneCollision(plane_normal, plane_point, ray_d, ray_o)
+        if intersection_point is not None and \
+                intersection_point[1] >= min_y and intersection_point[1] <= max_y and \
+                intersection_point[2] >= min_z and intersection_point[2] <= max_z:
+                    pixels.append([idx])
+                    intersections.append(intersection_point)
+                    distances.append(np.linalg.norm(ray_o - intersection_point))
+    return pixels, intersections, distances
+
+def find_ray_intersections_from_tof(rays, tof):
+    """ Uses first bounce return to compute where the intersection of light and scene occurs """
+    pixels = []
+    intersections = []
+    distances = []
+    for i in range(rays.shape[0]):
+        rays_o, rays_d = rays[i][0], rays[i][1]
+        tof_i = np.reshape(tof[i], [-1, tof[i].shape[-1]])
+        intensities = np.max(tof_i, axis=1)
+        binidxs = np.argmax(tof_i, axis=1)
+        idx = binidxs[np.argmax(intensities)]
+        distance = ((idx + 1) * TIME_RES_M) / 2.0
+        intersection = rays_o + (distance * rays_d)
+        pixels.append([i])
+        intersections.append(intersection)
+        distances.append(distance)
+    return pixels, intersections, distances
+                
+EPSILON = 1e-5
+def normalize_min_max(tensor, new_max=1.0, new_min=0.0):
+     return (tensor - tensor.min())/(tensor.max() - tensor.min() + EPSILON)*(new_max - new_min) + new_min
+
 def train():
 
     parser = config_parser()
@@ -615,23 +594,37 @@ def train():
 
     # Load data
     K = None
-    if args.dataset_type == "real":
-        tof, shadows, light_inters, rays, bin_width, light_pos = load_real(args.datadir)
-        TIME_RES_S = bin_width
-        TIME_RES_M = bin_width * SPEED_OF_LIGHT
+    if args.dataset_type == "dtof":
+        tof, poses, light_o, light_d, hwf, walls_cam, walls_light = load_tof_data(args.datadir, args.ignore)
+        print('Loaded ToF data', tof.shape, light_o.shape, light_d.shape, hwf, args.datadir, walls_cam.shape, walls_light.shape)
+        render_poses = torch.tensor([0.0]).float()
         i_train = np.arange(tof.shape[0])
         i_val = []
         i_test = []
-
-        H, W = tof.shape[1], tof.shape[2]
 
         print("Train idxs: {}".format(i_train))
 
         near = args.near
         far = 6.0
+
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
+
+    # Cast intrinsics to right types
+    H, W, focal = hwf
+    H, W = int(H), int(W)
+    hwf = [H, W, focal]
+
+    if K is None:
+        K = np.array([
+            [focal, 0, 0.5*W],
+            [0, focal, 0.5*H],
+            [0, 0, 1]
+        ])
+
+    if args.render_test:
+        render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
@@ -662,35 +655,146 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
 
+    # For random ray batching
+    print('get rays')
+    poses[:,2,:] *= -1
+    poses[:,0,:] *= -1
+    rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+
+    # we need this if using subset of illumination points in i_train
+    light_o = np.stack([light_o[i] for i in i_train],0)
+    light_d = np.stack([light_d[i] for i in i_train],0)
+    walls_cam = np.stack([walls_cam[i] for i in i_train],0)
+    walls_light = np.stack([walls_light[i] for i in i_train],0)
+    tof = np.stack([tof[i] for i in i_train],0)
+
     rays = np.transpose(rays, [0,2,3,1,4]) # [N, H, W, ro+rd+lo+ld, 3]
     rays = np.stack([rays[i] for i in i_train], 0) # train cameras only
     rays = np.reshape(rays, [-1,2,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
     rays = rays.astype(np.float32)
 
+    # normalizing ray directions!
+    rays_d = rays[:,1,:]
+    norm = np.linalg.norm(rays[:,1,:], axis=1)
+    rays[:,1] = rays_d / norm[:,None]
+
+    walls_cam = np.tile(walls_cam, H*W).reshape((walls_cam.shape[0], H, W, walls_cam.shape[1])) 
+    walls_cam = np.reshape(walls_cam, [-1, walls_cam.shape[-1]])
+
     i_batch = 0
 
-    light_dists = np.linalg.norm(light_inters - light_pos, axis=1)
+    """ light intersections """
+    light_rays = np.stack([light_o, light_d],1)
+    light_idx, light_inters, light_dists = None, None, None
+    if args.extract_first == 1:
+        light_idx, light_inters, light_dists = find_ray_intersections_from_tof(light_rays, tof)
+    else:
+        # this should only be used for debugging - directly compute light intersection based on known geometry
+        light_idx, light_inters, light_dists = find_ray_intersections(light_rays, walls_light)
+    light_inters = np.array(light_inters)
+
+    if args.save_lights == 1:
+        np.save("{}/lights.npy".format(os.path.join(basedir, expname)), light_inters)
+        exit()
+
+    print("The following projected lights have been found:", light_idx)
+    assert len(light_idx) == len(i_train)
     light_inters = np.tile(light_inters, H*W).reshape((light_inters.shape[0], H, W, light_inters.shape[1]))
     light_inters = np.reshape(light_inters, [-1, light_inters.shape[-1]])
 
+    light_dists = np.array(light_dists)
     light_dists = np.tile(light_dists[:,None], H*W).reshape((light_dists.shape[0], H, W))
     light_dists = np.reshape(light_dists, [-1, 1])
 
-    tof = np.multiply(tof, shadows)
+    light_dirs = np.tile(light_d, H*W).reshape((light_d.shape[0], H, W, light_d.shape[1]))
+    light_dirs = np.reshape(light_dirs, [-1, light_dirs.shape[-1]])
 
-    tof = np.reshape(tof, [-1,1])
+    """ Filter out rays near illumination spot + separate shadows w/ matched filter """
+
+    # Filter out rays close to illumination
+    parallel = np.linalg.norm(np.cross(rays[:,1,:], light_dirs), axis=1)
+    mask = parallel < args.parallel
+    mask = np.array(mask, dtype=np.uint8)
+
+    b1 = parallel < 0.005
+    b1 = np.array(b1, dtype=np.uint8)
+    b1 = np.reshape(b1, [light_d.shape[0], H, W])
+
+    tof = np.reshape(tof, [-1, tof.shape[-1]])
     tof = tof.astype(np.float32)
-    shadows = np.reshape(shadows, [-1,1])
+
+    noise = np.zeros([tof.shape[0],])
+    if args.noise != 0:
+        noise_m = 1e-12 * args.noise * SPEED_OF_LIGHT
+        noise = np.random.normal(0.0, noise_m / FWHM_TO_SIGMA, tof.shape[0])
+        print("adding noise of {} m (FWHM)! Resulting min {}, max {} m.".format(noise_m, np.min(noise), np.max(noise)))
+    noise = noise[::args.downsample]
+    
+    tof = np.reshape(tof, [light_d.shape[0], H, W, -1])
+    mask = np.reshape(mask, [light_d.shape[0], H, W])
+    tof_stack = []
+
+    """ Matched filter code is slow --> we can opt not to run it for debugging, but note tof will not be usable for training """
+    if args.debug == 0:
+        tof_1b_norm = 0
+
+        shadow_savedir = os.path.join(basedir, expname, "shadows")
+        os.makedirs(shadow_savedir, exist_ok=True)
+        for i, tofi in enumerate(tof):
+            print("Preprocessing tof image {} of {}.".format(i+1, tof.shape[0]))
+            tof_1b = tofi[b1[i] == 1.0][0]
+            tof_1b_norm = tof_1b / np.sum(tof_1b) 
+
+            tofi[mask[i]==1.0] = 0.0 # Filter 1st bounce returns based on angle
+            corr = np.zeros([H,W])
+            for pixeli in range(H):
+                for pixelj in range(W):
+                    pix = tofi[pixeli][pixelj]
+                    if np.sum(pix) != 0:
+                        pix = pix / np.sum(pix)
+
+                    cc = scisig.correlate(pix, tof_1b_norm)
+                    corr[pixeli,pixelj] = np.max(cc)
+
+            thresh = args.per_image_thresh[i]
+            corr[corr < thresh] = 0
+            corr[corr >= thresh] = 1
+            arrivals = np.multiply(tofi, np.expand_dims(corr,2))
+            tof_stack.append(arrivals)
+
+            target_shadow = np.sum(arrivals, axis=2)
+            target_shadow[target_shadow > 0.0] = 1.0
+            target_shadow = np.stack([target_shadow, target_shadow, target_shadow],axis=2)
+            target_shadow = np.float32(target_shadow)
+            target_shadow = cv2.cvtColor(target_shadow, cv2.COLOR_BGR2GRAY)
+            cv2.imwrite("{}/shadow_{}.png".format(shadow_savedir, str(i).zfill(3)), target_shadow*255)
+
+        tof = np.stack(tof_stack, 0)
+ 
+    tof = np.reshape(tof, [-1, tof.shape[-1]])
+    tof = tof.astype(np.float32)
     rays = rays[::args.downsample]
     print("Rays: {}, Downsample: {}".format(rays.shape[0], args.downsample))
     light_inters = light_inters[::args.downsample]
     print("Light inters: {}, Downsample: {}".format(light_inters.shape[0], args.downsample))
     light_dists = light_dists[::args.downsample]
     print("Light dists: {}, Downsample: {}".format(light_dists.shape[0], args.downsample))
+    light_dirs = light_dirs[::args.downsample]
+    print("Light dirs: {}, Downsample: {}".format(light_dirs.shape[0], args.downsample))
     tof = tof[::args.downsample]
     print("ToF: {}, Downsample: {}".format(tof.shape[0], args.downsample))
-    shadows = shadows[::args.downsample]
-    print("Shadows: {}, Downsample: {}".format(shadows.shape[0], args.downsample))
+
+
+    # Ablation on downsampling temporal resolution
+    if args.downsample_temp:
+        tof_down = np.zeros([tof.shape[0], int(tof.shape[1] / args.downsample_temp)])
+        print("Integrating transient from shape {} to {} and temporal res {} to {}".format(tof.shape, tof_down.shape, TIME_RES_M, TIME_RES_M*args.downsample_temp))
+        for i in range(0, tof_down.shape[1], 1):
+            tof_down[:,i] = np.sum(tof[:,(i*args.downsample_temp):((i+1)*args.downsample_temp)], axis=1)
+        tof = tof_down
+        globals()["TIME_RES_M"] = TIME_RES_M * args.downsample_temp
+        globals()["TIME_RES_S"] = TIME_RES_S * args.downsample_temp
+        print(tof.shape, TIME_RES_M, TIME_RES_S)
 
     """ Permute all data used in training """
     print('shuffle rays and transients in unison')
@@ -699,41 +803,41 @@ def train():
     rays = rays[p]
     light_inters = light_inters[p]
     light_dists = light_dists[p]
-    shadows = shadows[p]
+    light_dirs = light_dirs[p]
     print('done')
-
+        
     """ Filter out shadow rays """
-    indices = np.where(tof == 0)[0]
+    tof_sum = np.sum(tof, axis=1)
+    indices = np.where(tof_sum == 0)[0]
     ftof = np.delete(tof, indices, axis=0)
     flight_inters = np.delete(light_inters, indices, axis=0)
     flight_dists = np.delete(light_dists, indices, axis=0)
     frays = np.delete(rays, indices, axis=0)
-    fshadows = np.delete(shadows, indices, axis=0)
+    fnoise = np.delete(noise, indices, axis=0)
 
-    # Move training data to GPU
-    # Only shadow rays
     tof = torch.Tensor(tof)
     light_inters = torch.Tensor(light_inters)
     light_dists = torch.Tensor(light_dists)
     rays = torch.Tensor(rays)
-    shadows = torch.Tensor(shadows)
+    noise = torch.Tensor(noise)
 
     ftof = torch.Tensor(ftof)
     flight_inters = torch.Tensor(flight_inters)
     flight_dists = torch.Tensor(flight_dists)
     frays = torch.Tensor(frays)
-    fshadows = torch.Tensor(fshadows)
+    fnoise = torch.Tensor(fnoise)
 
-    n_iters_pretrain = 20000
+    n_iters_pretrain = 25000
     DIST_WEIGHT = args.dist_weight
 
-    N_iters = 100000 + 1
+    N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
     criterion = torch.nn.MSELoss()
+
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -747,7 +851,7 @@ def train():
             batch_light_dists = flight_dists[i_batch:i_batch+N_rand].squeeze().to(device)
             batch_rays = frays[i_batch:i_batch+N_rand,:,:]
             batch_rays = torch.transpose(batch_rays, 0, 1).to(device)
-            target_shadow = fshadows[i_batch:i_batch+N_rand].to(device).squeeze()
+            batch_noise = fnoise[i_batch:i_batch+N_rand].to(device)
         else:
             dataset_size = light_inters.shape[0]
             target_tof = tof[i_batch:i_batch+N_rand].to(device)
@@ -755,10 +859,13 @@ def train():
             batch_light_dists = light_dists[i_batch:i_batch+N_rand].squeeze().to(device)
             batch_rays = rays[i_batch:i_batch+N_rand,:,:]
             batch_rays = torch.transpose(batch_rays, 0, 1).to(device)
-            target_shadow = shadows[i_batch:i_batch+N_rand].to(device).squeeze()
+            batch_noise = noise[i_batch:i_batch+N_rand].to(device)
 
-        target_dist = (target_tof * SPEED_OF_LIGHT) / 10.0 # distance supervision
-        target_dist = target_dist.squeeze()
+        target_dist_idx = torch.argmax(target_tof, dim=1)
+        target_dist_idx[target_dist_idx > 0] += 1
+        target_dist = ((target_dist_idx * TIME_RES_M) + batch_noise.squeeze()) / 15.0 # distance supervision
+        target_shadow = torch.sum(target_tof, dim=1) # transmittance probability supervision
+        target_shadow[target_shadow > 0.0] = 1.0
 
         secondary_idxs = torch.arange(0,1024)
         shadow_idxs = torch.where(target_shadow == 0.0)[0]
@@ -770,21 +877,21 @@ def train():
             target_pred = torch.stack([target_dist,target_shadow],dim=1)
 
         i_batch += N_rand
-        if i_batch+1024 >= dataset_size:
+        if i_batch >= dataset_size:
             if i < n_iters_pretrain:
                 rand_idx = torch.randperm(flight_inters.shape[0])
                 ftof = ftof[rand_idx]
                 flight_inters = flight_inters[rand_idx]
                 flight_dists = flight_dists[rand_idx]
                 frays = frays[rand_idx]
-                fshadows = fshadows[rand_idx]
+                fnoise = fnoise[rand_idx]
             else:
                 rand_idx = torch.randperm(light_inters.shape[0])
                 tof = tof[rand_idx]
                 light_inters = light_inters[rand_idx]
                 light_dists = light_dists[rand_idx]
                 rays = rays[rand_idx]
-                shadows = shadows[rand_idx]
+                noise = noise[rand_idx]
             i_batch = 0
 
         #####  Core optimization loop  #####
@@ -800,7 +907,7 @@ def train():
         batch_vray_d = batch_vray_d / norm[:,None]
         batch_vrays = torch.stack([batch_vray_o, batch_vray_d], 0)
 
-        total_distance_1 = (depth + norm + batch_light_dists) / 10.0
+        total_distance_1 = (depth + norm + batch_light_dists) / 15.0
 
         if i < n_iters_pretrain:
             loss_1 = criterion(total_distance_1, target_pred)
@@ -814,7 +921,7 @@ def train():
                                                              per_ray_far=norm,
                                                              **render_kwargs_train)
 
-            """ Visualize all rays """
+            """ Visualize all rays (creates a video) """
             if args.vis_rays:
                 import matplotlib.pyplot as plt
                 from matplotlib import animation
@@ -832,7 +939,6 @@ def train():
 
                         start = batch_vrays[0][idx]
                         direction = batch_vrays[1][idx]
-                        #stop = start + torch.mul(direction, b_depth[idx,None])
                         stop = b_extras['pts'][idx][-1]
                         line = torch.stack([start, stop], dim=0)
                         line = line.detach().cpu().numpy()
@@ -849,7 +955,7 @@ def train():
                 anim = animation.FuncAnimation(fig, animate, init_func=init,
                                                frames=360, interval=20, blit=True)
                 # Save
-                anim.save('animation_real.mp4', fps=30, extra_args=['-vcodec', 'libx264'])
+                anim.save('ray_animation.mp4', fps=30, extra_args=['-vcodec', 'libx264'])
                 exit()
 
             if "depth0" in b_extras:
@@ -891,7 +997,7 @@ def train():
             batch_vray_d = batch_vray_d / norm[:,None]
             batch_vrays = torch.stack([batch_vray_o, batch_vray_d], 0)
 
-            total_distance_2 = (depth0 + norm + batch_light_dists) / 10.0
+            total_distance_2 = (depth0 + norm + batch_light_dists) / 15.0
 
             if i < n_iters_pretrain:
                 loss_2 = criterion(total_distance_2, target_pred)
@@ -935,7 +1041,7 @@ def train():
 
         """ train! """
         optimizer.zero_grad()
-        loss = (loss_1 + loss_2) * 100.0
+        loss = 100 * (loss_1 + loss_2) # weight loss by 100 to prevent it from getting too small
         loss.backward()
         optimizer.step()
 
@@ -966,7 +1072,7 @@ def train():
 
         # Rest is logging
         if i%args.i_weights==0:
-            path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
+            path = os.path.join(basedir, expname, '{:06d}_c384.tar'.format(i))
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),

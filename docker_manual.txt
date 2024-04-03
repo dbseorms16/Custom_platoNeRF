@@ -1,0 +1,20 @@
+
+### docker
+
+docker build -t nerf:0.1 ./
+watch -d -n 0.5 nvidia-smi
+docker ps -a
+docker exec -it d311826880a4 /bin/bash
+sudo docker run -d -it --name nerf --gpus all --ipc=host -v /home/aims/Desktop/JunSeok/PlatoNeRF:/root -p 8000:8000 nerf:0.1
+docker run -d -it --name mmseg --gpus all --ipc=host -v /home/aims/Desktop/JunSeok/mmsegmentation:/root -p 8888:8888 mmsegmentation:0.1
+
+
+## Test
+
+unzip compressed.zip  -d /path/to/put
+
+apt-get update -y
+apt-get install -y libgl1-mesa-glx
+
+python src/run_platonerf.py --config configs/chair.txt
+python src/render_test_depth.py --config configs/chair.txt --output_dir logs/chair

@@ -1,0 +1,9 @@
+python src/render_test_depth.py --config configs/chair.txt --ft_path pretrained/chair.tar --output_dir logs/chair
+
+python src/run_platonerf.py --config configs/chair.txt
+
+python src/render_test_depth.py --config configs/chair.txt --output_dir logs/chair
+
+python src/run_platonerf_real.py --config configs/real.txt
+
+python src/render_depth_real.py --config configs/real.txt --output_dir logs/real
