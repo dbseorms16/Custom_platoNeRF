@@ -1,4 +1,4 @@
-expname = occlusion/transformer
+expname = occlusion/origin
 basedir = ./logs
 datadir = ./data/occlusion
 dataset_type = dtof

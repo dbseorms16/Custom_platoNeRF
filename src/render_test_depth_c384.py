@@ -20,9 +20,9 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 
 from utils.load_tof import load_tof_data
-from utils.nerf_helpers import *
+from utils.nerf_helpers_c384 import *
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -421,11 +421,11 @@ def config_parser():
     parser.add_argument("--noise", type=float, default=0.0, help="gaussian noise on time of arrival")
     parser.add_argument("--netdepth", type=int, default=8, 
                         help='layers in network')
-    parser.add_argument("--netwidth", type=int, default=256, 
+    parser.add_argument("--netwidth", type=int, default=384, 
                         help='channels per layer')
     parser.add_argument("--netdepth_fine", type=int, default=8, 
                         help='layers in fine network')
-    parser.add_argument("--netwidth_fine", type=int, default=256, 
+    parser.add_argument("--netwidth_fine", type=int, default=384, 
                         help='channels per layer in fine network')
     parser.add_argument("--N_rand", type=int, default=32*32*4, 
                         help='batch size (number of random rays per gradient step)')
@@ -560,7 +560,7 @@ def train():
     args.N_samples = 1024
     batch_size = 512
 
-    output_dir = os.path.join(args.output_dir, "depth_predictions")
+    output_dir = os.path.join(args.output_dir, "depth_predictions_c384")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 

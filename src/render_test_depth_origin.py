@@ -20,9 +20,9 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 
 from utils.load_tof import load_tof_data
-from utils.nerf_helpers import *
+from utils.nerf_helpers_origin import *
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_VISIBLE_DEVICES"]="2"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -560,7 +560,7 @@ def train():
     args.N_samples = 1024
     batch_size = 512
 
-    output_dir = os.path.join(args.output_dir, "depth_predictions")
+    output_dir = os.path.join(args.output_dir, "depth_predictions_origin")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
